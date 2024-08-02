@@ -677,7 +677,14 @@ void rwnx_tx_push(struct rwnx_hw *rwnx_hw, struct rwnx_txhdr *txhdr, int flags)
         sw_txhdr->need_cfm = 1;
         sw_txhdr->desc.host.status_desc_addr = ((1<<31) | rwnx_hw->usb_env.txdesc_free_idx[0]);
         aicwf_usb_host_txdesc_push(&(rwnx_hw->usb_env), 0, (long)(skb));
-        AICWFDBG(LOGINFO, "need cfm ethertype:%8x,user_idx=%d, skb=%p sta_idx:%d\n", 
+        if((sw_txhdr->desc.host.flags & TXU_CNTRL_MGMT))
+		AICWFDBG(LOGINFO, "need cfm mgmt:%x,user_idx=%d, skb=%p sta_idx:%d\n",
+			*(skb->data+sw_txhdr->headroom),
+			rwnx_hw->usb_env.txdesc_free_idx[0],
+			skb,
+			sw_txhdr->desc.host.staid);
+	else
+		AICWFDBG(LOGINFO, "need cfm ethertype:%8x,user_idx=%d, skb=%p sta_idx:%d\n",
 			sw_txhdr->desc.host.ethertype, 
 			rwnx_hw->usb_env.txdesc_free_idx[0], 
 			skb,
@@ -1324,6 +1331,9 @@ int intf_tx(struct rwnx_hw *priv,struct msg_buf *msg)
 	sw_txhdr->amsdu.len = 0;
 	sw_txhdr->amsdu.nb = 0;
 #endif
+	sw_txhdr->raw_frame = 0;
+	sw_txhdr->fixed_rate = 0;
+
 	// Fill-in the descriptor
 	memcpy(&desc->host.eth_dest_addr, eth_t.h_dest, ETH_ALEN);
 	memcpy(&desc->host.eth_src_addr, eth_t.h_source, ETH_ALEN);
@@ -1380,7 +1390,7 @@ int intf_tx(struct rwnx_hw *priv,struct msg_buf *msg)
 	desc->host.packet_addr = sw_txhdr->dma_addr + frame_oft;
 #endif
 #endif
-	//desc->host.hostid = sw_txhdr->dma_addr;
+	desc->host.status_desc_addr = sw_txhdr->dma_addr;
 
 	spin_lock_bh(&rwnx_hw->tx_lock);
 	if (rwnx_txq_queue_skb(skb, txq, rwnx_hw, false))
@@ -1451,6 +1461,9 @@ netdev_tx_t rwnx_start_xmit(struct sk_buff *skb, struct net_device *dev)
 
         skb = newskb;
     }
+
+	if(skb->priority < 3)
+		skb->priority = 0;
 
 #ifdef CONFIG_FILTER_TCP_ACK
         msgbuf=intf_tcp_alloc_msg(msgbuf);
@@ -2285,8 +2298,9 @@ int rwnx_txdatacfm(void *pthis, void *host_id)
     }
 #endif /* CONFIG_RWNX_AMSDUS_TX */
 
+    headroom = sw_txhdr->headroom;
     kmem_cache_free(rwnx_hw->sw_txhdr_cache, sw_txhdr);
-    skb_pull(skb, sw_txhdr->headroom);
+    skb_pull(skb, headroom);
     consume_skb(skb);
 
     return 0;

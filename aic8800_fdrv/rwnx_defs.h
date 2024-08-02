@@ -73,7 +73,18 @@
 #define HIGH_KERNEL_VERSION4 KERNEL_VERSION(6, 3, 0)
 #endif
 
-
+#ifndef IEEE80211_MAX_AMPDU_BUF
+#define IEEE80211_MAX_AMPDU_BUF                             0x100
+#endif
+#ifndef IEEE80211_HE_PHY_CAP6_TRIG_MU_BEAMFORMER_FB
+#define IEEE80211_HE_PHY_CAP6_TRIG_MU_BEAMFORMER_FB         0x08
+#endif
+#ifndef IEEE80211_HE_PHY_CAP6_TRIG_SU_BEAMFORMER_FB
+#define IEEE80211_HE_PHY_CAP6_TRIG_SU_BEAMFORMER_FB         0x04
+#endif
+#ifndef IEEE80211_HE_PHY_CAP3_RX_HE_MU_PPDU_FROM_NON_AP_STA
+#define IEEE80211_HE_PHY_CAP3_RX_HE_MU_PPDU_FROM_NON_AP_STA 0x40
+#endif
 
 #if LINUX_VERSION_CODE >= HIGH_KERNEL_VERSION
 #define IEEE80211_MAX_AMPDU_BUF                             IEEE80211_MAX_AMPDU_BUF_HE
@@ -345,6 +356,7 @@ struct rwnx_vif {
     struct rwnx_key key[6];
     unsigned long drv_flags;
     atomic_t drv_conn_state;
+    u8 is_conn;
     u8 drv_vif_index;           /* Identifier of the VIF in driver */
     u8 vif_index;               /* Identifier of the station in FW */
     u8 ch_index;                /* Channel context identifier */
@@ -720,8 +732,10 @@ struct rwnx_hw {
     atomic_t p2p_alive_timer_count;
     bool band_5g_support;
     bool fwlog_en;
+    bool scanning;
+    bool p2p_working;
 
-	struct work_struct apmStalossWork;
+    struct work_struct apmStalossWork;
     struct workqueue_struct *apmStaloss_wq;
     u8 apm_vif_idx;
     u8 sta_mac_addr[6];

@@ -116,24 +116,27 @@ static inline int rwnx_rx_chan_switch_ind(struct rwnx_hw *rwnx_hw,
     } else {
         /* Retrieve the allocated RoC element */
         struct rwnx_roc_elem *roc_elem = rwnx_hw->roc_elem;
+        if (roc_elem) {
+            /* If mgmt_roc is true, remain on channel has been started by ourself */
+            if (!roc_elem->mgmt_roc) {
+                /* Inform the host that we have switch on the indicated off-channel */
+                #if LINUX_VERSION_CODE < KERNEL_VERSION(3, 6, 0)
+                cfg80211_ready_on_channel(roc_elem->wdev->netdev, (u64)(rwnx_hw->roc_cookie_cnt),
+                                        roc_elem->chan, NL80211_CHAN_HT20, roc_elem->duration, GFP_ATOMIC);
+                #elif LINUX_VERSION_CODE < KERNEL_VERSION(3, 8, 0)
+                cfg80211_ready_on_channel(roc_elem->wdev, (u64)(rwnx_hw->roc_cookie_cnt),
+                                        roc_elem->chan, NL80211_CHAN_HT20, roc_elem->duration, GFP_ATOMIC);
+                #else
+                cfg80211_ready_on_channel(roc_elem->wdev, (u64)(rwnx_hw->roc_cookie_cnt),
+                                        roc_elem->chan, roc_elem->duration, GFP_ATOMIC);
+                #endif
+            }
 
-        /* If mgmt_roc is true, remain on channel has been started by ourself */
-        if (!roc_elem->mgmt_roc) {
-            /* Inform the host that we have switch on the indicated off-channel */
-#if LINUX_VERSION_CODE < KERNEL_VERSION(3, 6, 0)
-	    cfg80211_ready_on_channel(roc_elem->wdev->netdev, (u64)(rwnx_hw->roc_cookie_cnt),
-                                      roc_elem->chan, NL80211_CHAN_HT20, roc_elem->duration, GFP_ATOMIC);
-#elif LINUX_VERSION_CODE < KERNEL_VERSION(3, 8, 0)
-	    cfg80211_ready_on_channel(roc_elem->wdev, (u64)(rwnx_hw->roc_cookie_cnt),
-                                      roc_elem->chan, NL80211_CHAN_HT20, roc_elem->duration, GFP_ATOMIC);
-#else
-            cfg80211_ready_on_channel(roc_elem->wdev, (u64)(rwnx_hw->roc_cookie_cnt),
-                                      roc_elem->chan, roc_elem->duration, GFP_ATOMIC);
-#endif
+            /* Keep in mind that we have switched on the channel */
+            roc_elem->on_chan = true;
+        } else {
+            printk("roc_elem == null\n");
         }
-
-        /* Keep in mind that we have switched on the channel */
-        roc_elem->on_chan = true;
 
         // Enable traffic on OFF channel queue
         rwnx_txq_offchan_start(rwnx_hw);
@@ -603,7 +606,6 @@ static inline int rwnx_rx_scan_done_ind(struct rwnx_hw *rwnx_hw,
  * Messages from SCANU task
  **************************************************************************/
 #ifdef CONFIG_RWNX_FULLMAC
-extern uint8_t scanning;
 static inline int rwnx_rx_scanu_start_cfm(struct rwnx_hw *rwnx_hw,
                                           struct rwnx_cmd *cmd,
                                           struct ipc_e2a_msg *msg)
@@ -666,7 +668,7 @@ static inline int rwnx_rx_scanu_start_cfm(struct rwnx_hw *rwnx_hw,
 #endif//CONFIG_SCHED_SCAN
 
     rwnx_hw->scan_request = NULL;
-    scanning = 0;
+    rwnx_hw->scanning = 0;
 
     return 0;
 }
@@ -989,7 +991,7 @@ static inline int rwnx_rx_sm_connect_ind(struct rwnx_hw *rwnx_hw,
 
 	do {
 		bss = cfg80211_get_bss(wdev->wiphy, NULL, rwnx_vif->sta.bssid,
-#if LINUX_VERSION_CODE >= HIGH_KERNEL_VERSION
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 19, 2)
 							wdev->u.client.ssid, wdev->u.client.ssid_len,
 #else
 							wdev->ssid, wdev->ssid_len,
@@ -1018,7 +1020,7 @@ static inline int rwnx_rx_sm_connect_ind(struct rwnx_hw *rwnx_hw,
 #else
 				WLAN_CAPABILITY_ESS,
 #endif
-#if LINUX_VERSION_CODE >= HIGH_KERNEL_VERSION
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 19, 2)
 				(int)wdev->u.client.ssid_len,
 				wdev->u.client.ssid, 
 #else
@@ -1038,7 +1040,7 @@ static inline int rwnx_rx_sm_connect_ind(struct rwnx_hw *rwnx_hw,
 				rwnx_vif->sta.bssid[0], rwnx_vif->sta.bssid[1], rwnx_vif->sta.bssid[2],
 				rwnx_vif->sta.bssid[3], rwnx_vif->sta.bssid[4], rwnx_vif->sta.bssid[5]);
 
-#if LINUX_VERSION_CODE >= HIGH_KERNEL_VERSION
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 19, 2)
 			wdev->u.client.ssid_len = (int)rwnx_vif->sta.ssid_len;
 			memcpy(wdev->u.client.ssid, rwnx_vif->sta.ssid, wdev->u.client.ssid_len);
 #else
@@ -1055,10 +1057,12 @@ static inline int rwnx_rx_sm_connect_ind(struct rwnx_hw *rwnx_hw,
 	} while (!bss);
 
     if (!ind->roamed) {//not roaming
+        if (rwnx_vif->is_conn == 0) {
         cfg80211_connect_result(dev, (const u8 *)ind->bssid.array, req_ie,
                                 ind->assoc_req_ie_len, rsp_ie,
                                 ind->assoc_rsp_ie_len, ind->status_code,
                                 GFP_ATOMIC);
+        }
 		if (ind->status_code == 0) {
 			atomic_set(&rwnx_vif->drv_conn_state, (int)RWNX_DRV_STATUS_CONNECTED);
 		} else {

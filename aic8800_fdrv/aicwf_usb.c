@@ -34,10 +34,12 @@ extern atomic_t aicwf_deinit_atomic;
 
 #ifdef CONFIG_TXRX_THREAD_PRIO
 
-#if (LINUX_VERSION_CODE >= KERNEL_VERSION(4, 11, 0))
+#if (LINUX_VERSION_CODE >= KERNEL_VERSION(5, 4, 0))
 #include "uapi/linux/sched/types.h"
+#elif (LINUX_VERSION_CODE >= KERNEL_VERSION(4, 15, 0))
+#include "linux/sched/types.h"
 #else
-#include "linux/sched.h"
+#include "linux/sched/rt.h"
 #endif
 
 int bustx_thread_prio = 1;
@@ -365,6 +367,7 @@ static void aicwf_usb_rx_complete(struct urb *urb)
 	}
 
     if (urb->actual_length > urb->transfer_buffer_length) {
+        usb_err("urb_rx len error %u/%u\n", urb->actual_length, urb->transfer_buffer_length);
         aicwf_dev_skb_free(skb);
         aicwf_usb_rx_buf_put(usb_dev, usb_buf);
         aicwf_usb_rx_submit_all_urb_(usb_dev);
@@ -406,10 +409,136 @@ static void aicwf_usb_rx_complete(struct urb *urb)
 
         skb_put(skb, urb->actual_length);
 
-        spin_lock_irqsave(&rx_priv->rxqlock, flags);
         if (aicwf_usb_rx_aggr) {
-	    skb->len = urb->actual_length;
+            skb->len = urb->actual_length;
+        } else {
+#ifdef CONFIG_USB_RX_REASSEMBLE
+            bool pkt_check = false;
+            if (rx_priv->rx_reassemble_skb) {
+                u32 frag_len = skb->len;
+                struct sk_buff *reassemble_skb = rx_priv->rx_reassemble_skb;
+                bool reassemble_valid = false;
+                bool reassemble_done = false;
+                if ((rx_priv->rx_reassemble_cur_frags + 1) == rx_priv->rx_reassemble_total_frags) {
+                    if ((rx_priv->rx_reassemble_cur_len + frag_len) == rx_priv->rx_reassemble_total_len) {
+                        reassemble_valid = true;
+                        reassemble_done = true;
+                    }
+                } else {
+                    if (frag_len == AICWF_USB_MAX_PKT_SIZE) {
+                        reassemble_valid = true;
+                    }
+                }
+
+                if (reassemble_valid) {
+                    memcpy((reassemble_skb->data + reassemble_skb->len), skb->data, frag_len);
+                    skb_put(reassemble_skb, skb->len);
+                    rx_priv->rx_reassemble_cur_len += frag_len;
+                    rx_priv->rx_reassemble_cur_frags++;
+                    aicwf_dev_skb_free(skb);
+                    if (reassemble_done) {
+                        skb = reassemble_skb;
+                        rx_priv->rx_reassemble_skb = NULL;
+                        rx_priv->rx_reassemble_total_len = 0;
+                        rx_priv->rx_reassemble_cur_len = 0;
+                        rx_priv->rx_reassemble_total_frags = 0;
+                        rx_priv->rx_reassemble_cur_frags = 0;
+                    } else {
+                        aicwf_usb_rx_buf_put(usb_dev, usb_buf);
+                        aicwf_usb_rx_submit_all_urb_(usb_dev);
+                        return;
+                    }
+                } else {
+                    usb_err("invalid frag pkt, len=%u/%u/%u, frags=%u/%u\n", frag_len,
+                        rx_priv->rx_reassemble_cur_len, rx_priv->rx_reassemble_cur_len,
+                        rx_priv->rx_reassemble_cur_frags, rx_priv->rx_reassemble_total_frags);
+                    aicwf_dev_skb_free(reassemble_skb);
+                    rx_priv->rx_reassemble_skb = NULL;
+                    rx_priv->rx_reassemble_total_len = 0;
+                    rx_priv->rx_reassemble_cur_len = 0;
+                    rx_priv->rx_reassemble_total_frags = 0;
+                    rx_priv->rx_reassemble_cur_frags = 0;
+                    pkt_check = true;
+                }
+            } else {
+                pkt_check = true;
+            }
+
+            if (pkt_check) {
+                bool pkt_drop = false;
+                u8 type = skb->data[2];
+                u32 pkt_len = skb->data[0] | (skb->data[1] << 8);
+                if ((type & USB_TYPE_CFG) != USB_TYPE_CFG) {
+                    u32 pkt_total_len = pkt_len + RX_HWHRD_LEN;
+                    if ((pkt_total_len > AICWF_USB_MAX_PKT_SIZE) && (skb->len == AICWF_USB_MAX_PKT_SIZE)) {
+                        AICWFDBG(LOGINFO, "reassemble pkt, len=%u\n", pkt_total_len);
+                        struct sk_buff *reassemble_skb = __dev_alloc_skb(pkt_total_len, GFP_ATOMIC/*GFP_KERNEL*/);
+                        if (reassemble_skb) {
+                            memcpy(reassemble_skb->data, skb->data, skb->len);
+                            skb_put(reassemble_skb, skb->len);
+                            rx_priv->rx_reassemble_skb = reassemble_skb;
+                            rx_priv->rx_reassemble_total_len = pkt_total_len;
+                            rx_priv->rx_reassemble_cur_len = skb->len;
+                            rx_priv->rx_reassemble_total_frags = ALIGN(pkt_total_len, AICWF_USB_MAX_PKT_SIZE) / AICWF_USB_MAX_PKT_SIZE;
+                            rx_priv->rx_reassemble_cur_frags = 1;
+                        } else {
+                            usb_err("reassemble pkt alloc fail, len=%u\n", pkt_total_len);
+                        }
+                        aicwf_dev_skb_free(skb);
+                        aicwf_usb_rx_buf_put(usb_dev, usb_buf);
+                        aicwf_usb_rx_submit_all_urb_(usb_dev);
+                        return;
+                    } else if (pkt_total_len != skb->len) {
+                        usb_err("invalid DATA, len=%u/%u\n", pkt_len, skb->len);
+                        pkt_drop = true;
+                    }
+                } else {
+                    if (type == USB_TYPE_CFG_CMD_RSP) {
+                        u32 pkt_total_len = ALIGN((pkt_len + 4), 4);
+                        if ((pkt_total_len > AICWF_USB_MAX_PKT_SIZE) && (skb->len == AICWF_USB_MAX_PKT_SIZE)) {
+                            AICWFDBG(LOGINFO, "reassemble pkt, len=%u\n", pkt_total_len);
+                            struct sk_buff *reassemble_skb = __dev_alloc_skb(pkt_total_len, GFP_ATOMIC/*GFP_KERNEL*/);
+                            if (reassemble_skb) {
+                                memcpy(reassemble_skb->data, skb->data, skb->len);
+                                skb_put(reassemble_skb, skb->len);
+                                rx_priv->rx_reassemble_skb = reassemble_skb;
+                                rx_priv->rx_reassemble_total_len = pkt_total_len;
+                                rx_priv->rx_reassemble_cur_len = skb->len;
+                                rx_priv->rx_reassemble_total_frags = ALIGN(pkt_total_len, AICWF_USB_MAX_PKT_SIZE) / AICWF_USB_MAX_PKT_SIZE;
+                                rx_priv->rx_reassemble_cur_frags = 1;
+                            } else {
+                                usb_err("reassemble pkt alloc fail, len=%u\n", pkt_total_len);
+                            }
+                            aicwf_dev_skb_free(skb);
+                            aicwf_usb_rx_buf_put(usb_dev, usb_buf);
+                            aicwf_usb_rx_submit_all_urb_(usb_dev);
+                            return;
+                        } else if (pkt_total_len != skb->len) {
+                            usb_err("invalid CMD_RSP, len=%u/%u\n", pkt_len, skb->len);
+                            pkt_drop = true;
+                        }
+                    } else if (type == USB_TYPE_CFG_DATA_CFM) {
+                        if (!((pkt_len == 8) && (skb->len == 12))) {
+                            usb_err("invalid DATA_CFM, len=%u/%u\n", pkt_len, skb->len);
+                            pkt_drop = true;
+                        }
+                    } else {
+                        usb_err("invalid pkt, type=0x%x, len=%u/%u\n", type, pkt_len, skb->len);
+                        pkt_drop = true;
+                    }
+                }
+
+                if (pkt_drop) {
+                    aicwf_dev_skb_free(skb);
+                    aicwf_usb_rx_buf_put(usb_dev, usb_buf);
+                    aicwf_usb_rx_submit_all_urb_(usb_dev);
+                    return;
+                }
+            }
+#endif
         }
+
+        spin_lock_irqsave(&rx_priv->rxqlock, flags);
         if(!aicwf_rxframe_enqueue(usb_dev->dev, &rx_priv->rxq, skb)){
             spin_unlock_irqrestore(&rx_priv->rxqlock, flags);
             usb_err("rx_priv->rxq is over flow!!!\n");
@@ -455,6 +584,7 @@ static void aicwf_usb_msg_rx_complete(struct urb *urb)
     usb_buf->skb = NULL;
 
     if (urb->actual_length > urb->transfer_buffer_length) {
+        usb_err("usb_msg_rx len error %u/%u\n", urb->actual_length, urb->transfer_buffer_length);
         aicwf_dev_skb_free(skb);
         aicwf_usb_msg_rx_buf_put(usb_dev, usb_buf);
 		aicwf_usb_msg_rx_submit_all_urb_(usb_dev);
@@ -478,6 +608,109 @@ static void aicwf_usb_msg_rx_complete(struct urb *urb)
 
     if (usb_dev->state == USB_UP_ST) {
         skb_put(skb, urb->actual_length);
+
+#ifdef CONFIG_USB_RX_REASSEMBLE
+        bool pkt_check = false;
+        if (rx_priv->rx_msg_reassemble_skb) {
+            u32 frag_len = skb->len;
+            struct sk_buff *reassemble_skb = rx_priv->rx_msg_reassemble_skb;
+            bool reassemble_valid = false;
+            bool reassemble_done = false;
+            if ((rx_priv->rx_msg_reassemble_cur_frags + 1) == rx_priv->rx_msg_reassemble_total_frags) {
+                if ((rx_priv->rx_msg_reassemble_cur_len + frag_len) == rx_priv->rx_msg_reassemble_total_len) {
+                    reassemble_valid = true;
+                    reassemble_done = true;
+                }
+            } else {
+                if (frag_len == AICWF_USB_MSG_MAX_PKT_SIZE) {
+                    reassemble_valid = true;
+                }
+            }
+
+            if (reassemble_valid) {
+                memcpy((reassemble_skb->data + reassemble_skb->len), skb->data, frag_len);
+                skb_put(reassemble_skb, skb->len);
+                rx_priv->rx_msg_reassemble_cur_len += frag_len;
+                rx_priv->rx_msg_reassemble_cur_frags++;
+                aicwf_dev_skb_free(skb);
+                if (reassemble_done) {
+                    skb = reassemble_skb;
+                    rx_priv->rx_msg_reassemble_skb = NULL;
+                    rx_priv->rx_msg_reassemble_total_len = 0;
+                    rx_priv->rx_msg_reassemble_cur_len = 0;
+                    rx_priv->rx_msg_reassemble_total_frags = 0;
+                    rx_priv->rx_msg_reassemble_cur_frags = 0;
+                } else {
+                    aicwf_usb_msg_rx_buf_put(usb_dev, usb_buf);
+                    aicwf_usb_msg_rx_submit_all_urb_(usb_dev);
+                    return;
+                }
+            } else {
+                usb_err("invalid frag msg pkt, len=%u/%u/%u, frags=%u/%u\n", frag_len,
+                    rx_priv->rx_msg_reassemble_cur_len, rx_priv->rx_msg_reassemble_cur_len,
+                    rx_priv->rx_msg_reassemble_cur_frags, rx_priv->rx_msg_reassemble_total_frags);
+                aicwf_dev_skb_free(reassemble_skb);
+                rx_priv->rx_msg_reassemble_skb = NULL;
+                rx_priv->rx_msg_reassemble_total_len = 0;
+                rx_priv->rx_msg_reassemble_cur_len = 0;
+                rx_priv->rx_msg_reassemble_total_frags = 0;
+                rx_priv->rx_msg_reassemble_cur_frags = 0;
+                pkt_check = true;
+            }
+        } else {
+            pkt_check = true;
+        }
+
+        if (pkt_check) {
+            bool pkt_drop = false;
+            u8 type = skb->data[2];
+            u32 pkt_len = skb->data[0] | (skb->data[1] << 8);
+            if ((type & USB_TYPE_CFG) != USB_TYPE_CFG) {
+                usb_err("invalid msg pkt, type=0x%x, len=%u/%u\n", type, pkt_len, skb->len);;
+                pkt_drop = true;
+            } else {
+                if (type == USB_TYPE_CFG_CMD_RSP) {
+                    u32 pkt_total_len = ALIGN((pkt_len + 4), 4);
+                    if ((pkt_total_len > AICWF_USB_MSG_MAX_PKT_SIZE) && (skb->len == AICWF_USB_MSG_MAX_PKT_SIZE)) {
+                        AICWFDBG(LOGINFO, "reassemble msg pkt, len=%u\n", pkt_total_len);
+                        struct sk_buff *reassemble_skb = __dev_alloc_skb(pkt_total_len, GFP_ATOMIC/*GFP_KERNEL*/);
+                        if (reassemble_skb) {
+                            memcpy(reassemble_skb->data, skb->data, skb->len);
+                            skb_put(reassemble_skb, skb->len);
+                            rx_priv->rx_msg_reassemble_skb = reassemble_skb;
+                            rx_priv->rx_msg_reassemble_total_len = pkt_total_len;
+                            rx_priv->rx_msg_reassemble_cur_len = skb->len;
+                            rx_priv->rx_msg_reassemble_total_frags = ALIGN(pkt_total_len, AICWF_USB_MSG_MAX_PKT_SIZE) / AICWF_USB_MSG_MAX_PKT_SIZE;
+                            rx_priv->rx_msg_reassemble_cur_frags = 1;
+                        } else {
+                            usb_err("reassemble msg pkt alloc fail, len=%u\n", pkt_total_len);
+                        }
+                        aicwf_dev_skb_free(skb);
+                        aicwf_usb_msg_rx_buf_put(usb_dev, usb_buf);
+                        aicwf_usb_msg_rx_submit_all_urb_(usb_dev);
+                        return;
+                    } else if (pkt_total_len != skb->len) {
+                        usb_err("invalid CMD_RSP, len=%u/%u\n", pkt_len, skb->len);
+                        pkt_drop = true;
+                    }
+                } else if (type == USB_TYPE_CFG_DATA_CFM) {
+                    if (!((pkt_len == 8) && (skb->len == 12))) {
+                        usb_err("invalid DATA_CFM, len=%u/%u\n", pkt_len, skb->len);
+                        pkt_drop = true;
+                    }
+                } else {
+                    usb_err("invalid msg pkt, type=0x%x, len=%u/%u\n", type, pkt_len, skb->len);
+                    pkt_drop = true;
+                }
+            }
+            if (pkt_drop) {
+                aicwf_dev_skb_free(skb);
+                aicwf_usb_msg_rx_buf_put(usb_dev, usb_buf);
+                aicwf_usb_msg_rx_submit_all_urb_(usb_dev);
+                return;
+            }
+        }
+#endif
 
         spin_lock_irqsave(&rx_priv->msg_rxqlock, flags);
         if(!aicwf_rxframe_enqueue(usb_dev->dev, &rx_priv->msg_rxq, skb)){
@@ -579,10 +812,17 @@ static int aicwf_usb_submit_rx_urb(struct aic_usb_dev *usb_dev,
 
     usb_buf->skb = skb;
 
-    usb_fill_bulk_urb(usb_buf->urb,
-        usb_dev->udev,
-        usb_dev->bulk_in_pipe,
-        skb->data, skb_tailroom(skb), aicwf_usb_rx_complete, usb_buf);
+    if (aicwf_usb_rx_aggr) {
+        usb_fill_bulk_urb(usb_buf->urb,
+            usb_dev->udev,
+            usb_dev->bulk_in_pipe,
+            skb->data, AICWF_USB_AGGR_MAX_PKT_SIZE, aicwf_usb_rx_complete, usb_buf);
+    } else {
+        usb_fill_bulk_urb(usb_buf->urb,
+            usb_dev->udev,
+            usb_dev->bulk_in_pipe,
+            skb->data, AICWF_USB_MAX_PKT_SIZE, aicwf_usb_rx_complete, usb_buf);
+    }
 
     usb_buf->usbdev = usb_dev;
 
@@ -644,7 +884,7 @@ static int aicwf_usb_submit_msg_rx_urb(struct aic_usb_dev *usb_dev,
         return -1;
     }
 
-    skb = __dev_alloc_skb(AICWF_USB_MAX_PKT_SIZE, GFP_ATOMIC);
+    skb = __dev_alloc_skb(AICWF_USB_MSG_MAX_PKT_SIZE, GFP_ATOMIC);
     if (!skb) {
         aicwf_usb_msg_rx_buf_put(usb_dev, usb_buf);
         return -1;
@@ -655,7 +895,7 @@ static int aicwf_usb_submit_msg_rx_urb(struct aic_usb_dev *usb_dev,
     usb_fill_bulk_urb(usb_buf->urb,
         usb_dev->udev,
         usb_dev->msg_in_pipe,
-        skb->data, skb_tailroom(skb), aicwf_usb_msg_rx_complete, usb_buf);
+        skb->data, AICWF_USB_MSG_MAX_PKT_SIZE, aicwf_usb_msg_rx_complete, usb_buf);
 
     usb_buf->usbdev = usb_dev;
 
@@ -1641,8 +1881,7 @@ static int aicwf_usb_bus_start(struct device *dev)
     aicwf_usb_rx_prepare(usb_dev);
     aicwf_usb_tx_prepare(usb_dev);
 #ifdef CONFIG_USB_MSG_IN_EP
-	if(usb_dev->chipid != PRODUCT_ID_AIC8801 &&
-        usb_dev->chipid != PRODUCT_ID_AIC8800D81){
+	if(usb_dev->msg_in_pipe){
 		aicwf_usb_msg_rx_prepare(usb_dev);
 	}
 #endif
@@ -1693,8 +1932,7 @@ static void aicwf_usb_cancel_all_urbs_(struct aic_usb_dev *usb_dev)
 
     usb_kill_anchored_urbs(&usb_dev->rx_submitted);
 #ifdef CONFIG_USB_MSG_IN_EP
-	if(usb_dev->chipid != PRODUCT_ID_AIC8801 &&
-        usb_dev->chipid != PRODUCT_ID_AIC8800D81){
+	if(usb_dev->msg_in_pipe){
    		usb_kill_anchored_urbs(&usb_dev->msg_rx_submitted);
 	}
 #endif
@@ -1731,8 +1969,7 @@ static void aicwf_usb_deinit(struct aic_usb_dev *usbdev)
     aicwf_usb_free_urb(&usbdev->rx_free_list, &usbdev->rx_free_lock);
     aicwf_usb_free_urb(&usbdev->tx_free_list, &usbdev->tx_free_lock);
 #ifdef CONFIG_USB_MSG_IN_EP
-	if(usbdev->chipid != PRODUCT_ID_AIC8801 &&
-        usbdev->chipid != PRODUCT_ID_AIC8800D81){
+	if(usbdev->msg_in_pipe){
 		cancel_work_sync(&usbdev->msg_rx_urb_work);
 		aicwf_usb_free_urb(&usbdev->msg_rx_free_list, &usbdev->msg_rx_free_lock);
 	}
@@ -1767,8 +2004,7 @@ static int aicwf_usb_init(struct aic_usb_dev *usb_dev)
     init_waitqueue_head(&usb_dev->msg_wait);
     init_usb_anchor(&usb_dev->rx_submitted);
 #ifdef CONFIG_USB_MSG_IN_EP
-	if(usb_dev->chipid != PRODUCT_ID_AIC8801 &&
-        usb_dev->chipid != PRODUCT_ID_AIC8800D81){
+	if(usb_dev->msg_in_pipe){
 		init_usb_anchor(&usb_dev->msg_rx_submitted);
 	}
 #endif
@@ -1778,8 +2014,7 @@ static int aicwf_usb_init(struct aic_usb_dev *usb_dev)
     spin_lock_init(&usb_dev->rx_free_lock);
     spin_lock_init(&usb_dev->tx_flow_lock);
 #ifdef CONFIG_USB_MSG_IN_EP
-	if(usb_dev->chipid != PRODUCT_ID_AIC8801 &&
-        usb_dev->chipid != PRODUCT_ID_AIC8800D81){
+	if(usb_dev->msg_in_pipe){
 		spin_lock_init(&usb_dev->msg_rx_free_lock);
 	}
 #endif
@@ -1788,8 +2023,7 @@ static int aicwf_usb_init(struct aic_usb_dev *usb_dev)
     INIT_LIST_HEAD(&usb_dev->tx_free_list);
     INIT_LIST_HEAD(&usb_dev->tx_post_list);
 #ifdef CONFIG_USB_MSG_IN_EP
-	if(usb_dev->chipid != PRODUCT_ID_AIC8801 &&
-        usb_dev->chipid != PRODUCT_ID_AIC8800D81){
+	if(usb_dev->msg_in_pipe){
 		INIT_LIST_HEAD(&usb_dev->msg_rx_free_list);
 	}
 #endif
@@ -1808,8 +2042,7 @@ static int aicwf_usb_init(struct aic_usb_dev *usb_dev)
         goto error;
     }
 #ifdef CONFIG_USB_MSG_IN_EP
-	if(usb_dev->chipid != PRODUCT_ID_AIC8801 &&
-        usb_dev->chipid != PRODUCT_ID_AIC8800D81){
+	if(usb_dev->msg_in_pipe){
 		ret =  aicwf_usb_alloc_msg_rx_urb(usb_dev);
 		if (ret) {
 			goto error;
@@ -1827,8 +2060,7 @@ static int aicwf_usb_init(struct aic_usb_dev *usb_dev)
 
     INIT_WORK(&usb_dev->rx_urb_work, aicwf_usb_rx_urb_work);
 #ifdef CONFIG_USB_MSG_IN_EP
-	if(usb_dev->chipid != PRODUCT_ID_AIC8801 &&
-        usb_dev->chipid != PRODUCT_ID_AIC8800D81){
+	if(usb_dev->msg_in_pipe){
 		INIT_WORK(&usb_dev->msg_rx_urb_work, aicwf_usb_msg_rx_urb_work);
 	}
 #endif
@@ -1923,8 +2155,7 @@ static int aicwf_parse_usb(struct aic_usb_dev *usb_dev, struct usb_interface *in
             }
 #ifdef CONFIG_USB_MSG_IN_EP
             else if (!usb_dev->msg_in_pipe) {
-				if(usb_dev->chipid != PRODUCT_ID_AIC8801 &&
-                    usb_dev->chipid != PRODUCT_ID_AIC8800D81){
+				if(usb_dev->chipid != PRODUCT_ID_AIC8801){
                 	usb_dev->msg_in_pipe = usb_rcvbulkpipe(usb, endpoint_num);
 				}
             }
@@ -1962,10 +2193,9 @@ static int aicwf_parse_usb(struct aic_usb_dev *usb_dev, struct usb_interface *in
     }
 #endif
 #ifdef CONFIG_USB_MSG_IN_EP
-		if(usb_dev->chipid != PRODUCT_ID_AIC8801 &&
-            usb_dev->chipid != PRODUCT_ID_AIC8800D81){
+		if(usb_dev->chipid != PRODUCT_ID_AIC8801){
 			if (usb_dev->msg_in_pipe == 0) {
-				usb_err("No RX Msg (in) Bulk EP found\n");
+				AICWFDBG(LOGINFO, "No RX Msg (in) Bulk EP found\n");
 			}
 		}
 #endif
@@ -2071,9 +2301,10 @@ static int aicwf_usb_chipmatch(struct aic_usb_dev *usb_dev, u16_l vid, u16_l pid
         usb_dev->chipid = PRODUCT_ID_AIC8800DW;
 		AICWFDBG(LOGINFO, "%s USE AIC8800DW\r\n", __func__);
         return 0;
-    }else if(pid == USB_PRODUCT_ID_AIC8800D81 || vid == USB_VENDOR_ID_TP || pid == USB_PRODUCT_ID_AIC8800D83){
+    }else if(pid == USB_PRODUCT_ID_AIC8800D81 || vid == USB_VENDOR_ID_TP || pid == USB_PRODUCT_ID_AIC8800D83
+         || vid == USB_VENDOR_ID_TENDA){
         usb_dev->chipid = PRODUCT_ID_AIC8800D81;
-	aicwf_usb_rx_aggr = true;
+        aicwf_usb_rx_aggr = true;
 		AICWFDBG(LOGINFO, "%s USE AIC8800D81\r\n", __func__);
         return 0;
     }else{
@@ -2341,12 +2572,14 @@ static struct usb_device_id aicwf_usb_id_table[] = {
 #else
     {USB_DEVICE_AND_INTERFACE_INFO(USB_VENDOR_ID_AIC, USB_PRODUCT_ID_AIC8801, 0xff, 0xff, 0xff)},
     {USB_DEVICE_AND_INTERFACE_INFO(USB_VENDOR_ID_AIC, USB_PRODUCT_ID_AIC8800D81, 0xff, 0xff, 0xff)},
+    {USB_DEVICE_AND_INTERFACE_INFO(USB_VENDOR_ID_AIC, USB_PRODUCT_ID_AIC8800D41, 0xff, 0xff, 0xff)},
     {USB_DEVICE_AND_INTERFACE_INFO(USB_VENDOR_ID_AIC, USB_PRODUCT_ID_AIC8800DC, 0xff, 0xff, 0xff)},
     {USB_DEVICE(USB_VENDOR_ID_AIC, USB_PRODUCT_ID_AIC8800DW)},
     {USB_DEVICE(USB_VENDOR_ID_AIC, USB_PRODUCT_ID_AIC8800D83)},
     {USB_DEVICE(USB_VENDOR_ID_TP, USB_PRODUCT_ID_TP)},
     {USB_DEVICE(USB_VENDOR_ID_TP, USB_PRODUCT_ID_MERCURY)},
     {USB_DEVICE(USB_VENDOR_ID_TP, USB_PRODUCT_ID_FAST)},
+    {USB_DEVICE(USB_VENDOR_ID_TENDA, USB_PRODUCT_ID_TENDA)},
 #endif
     {}
 };

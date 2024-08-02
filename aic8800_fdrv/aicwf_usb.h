@@ -17,19 +17,27 @@
 /* USB Device ID */
 #define USB_VENDOR_ID_AIC                0xA69C
 #define USB_VENDOR_ID_TP                 0x2357
+#define USB_VENDOR_ID_TENDA              0x2604
 
 #define USB_PRODUCT_ID_TP               0x014e
 #define USB_PRODUCT_ID_MERCURY          0x014b
 #define USB_PRODUCT_ID_FAST             0x014f
 
+#define USB_PRODUCT_ID_TENDA            0x001f
+
 #ifndef CONFIG_USB_BT
-#define USB_PRODUCT_ID_AIC8800               0x8800
+#define USB_PRODUCT_ID_AIC8800			0x8800
+#define USB_PRODUCT_ID_AIC8801			0x8801
+#define USB_PRODUCT_ID_AIC8800DC		0x88dc
+#define USB_PRODUCT_ID_AIC8800DW		0x88dd
+#define USB_PRODUCT_ID_AIC8800D81		0x8d81
 #else
-#define USB_PRODUCT_ID_AIC8801				0x8801
-#define USB_PRODUCT_ID_AIC8800DC			0x88dc
-#define USB_PRODUCT_ID_AIC8800DW            0x88dd
-#define USB_PRODUCT_ID_AIC8800D81           0x8d81
-#define USB_PRODUCT_ID_AIC8800D83           0x8d83
+#define USB_PRODUCT_ID_AIC8801			0x8801
+#define USB_PRODUCT_ID_AIC8800DC		0x88dc
+#define USB_PRODUCT_ID_AIC8800DW		0x88dd
+#define USB_PRODUCT_ID_AIC8800D81		0x8d81
+#define USB_PRODUCT_ID_AIC8800D41		0x8d41
+#define USB_PRODUCT_ID_AIC8800D83       0x8d83
 
 #endif
 
@@ -49,11 +57,16 @@ enum AICWF_IC{
 #define TXQLEN                          (2048*4)
 #define AICWF_USB_TX_URBS               (50)
 #else
-#define AICWF_USB_TX_URBS               200//(100)
+#define AICWF_USB_TX_URBS               50//(100)
 #endif
 #define AICWF_USB_TX_LOW_WATER         (AICWF_USB_TX_URBS/4)//25%
 #define AICWF_USB_TX_HIGH_WATER        (AICWF_USB_TX_LOW_WATER*3)//75%
+#ifdef CONFIG_PLATFORM_HI
+#define AICWF_USB_AGGR_MAX_PKT_SIZE     (2048*1)
+#else
 #define AICWF_USB_AGGR_MAX_PKT_SIZE     (2048*10)
+#endif
+#define AICWF_USB_MSG_MAX_PKT_SIZE      (2048)
 #define AICWF_USB_MAX_PKT_SIZE          (2048)
 #define AICWF_USB_FC_PERSTA_HIGH_WATER		64
 #define AICWF_USB_FC_PERSTA_LOW_WATER		16

@@ -464,8 +464,13 @@ static bool rwnx_rx_data_skb(struct rwnx_hw *rwnx_hw, struct rwnx_vif *rwnx_vif,
 
     if (amsdu) {
         int count;
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 3, 0)
         ieee80211_amsdu_to_8023s(skb, &list, rwnx_vif->ndev->dev_addr,
-                                 RWNX_VIF_TYPE(rwnx_vif), 0, NULL, NULL, 0);
+                                 RWNX_VIF_TYPE(rwnx_vif), 0, NULL, NULL, false);
+#else
+        ieee80211_amsdu_to_8023s(skb, &list, rwnx_vif->ndev->dev_addr,
+                                 RWNX_VIF_TYPE(rwnx_vif), 0, NULL, NULL);
+#endif
 
         count = skb_queue_len(&list);
         if (count > ARRAY_SIZE(rwnx_hw->stats.amsdus_rx))
@@ -1790,13 +1795,13 @@ int reord_process_unit(struct aicwf_rx_priv *rx_priv, struct sk_buff *skb, u16 s
 
     spin_lock_bh(&preorder_ctrl->reord_list_lock);
     if (reord_need_check(preorder_ctrl, pframe->seq_num)) {
-#if 0
+#if 1
 		if(pframe->rx_data[42] == 0x80){//this is rtp package
 			if(pframe->seq_num == preorder_ctrl->ind_sn){
-				printk("%s pframe->seq_num1:%d \r\n", __func__, pframe->seq_num);
+				//printk("%s pframe->seq_num1:%d \r\n", __func__, pframe->seq_num);
 	        	reord_single_frame_ind(rx_priv, pframe);//not need to reorder
 			}else{
-				printk("%s free pframe->seq_num:%d \r\n", __func__, pframe->seq_num);
+				//printk("%s free pframe->seq_num:%d \r\n", __func__, pframe->seq_num);
 			    if (pframe->pkt){
 			        dev_kfree_skb(pframe->pkt);
 			        pframe->pkt = NULL;
